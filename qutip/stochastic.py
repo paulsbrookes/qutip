@@ -854,7 +854,7 @@ def _ssesolve_single_trajectory(n, sso):
                                                   A[3].indptr, psi_t, 1) * dt
                     dW[a_idx, t_idx, j, :] = np.random.poisson(dw_expect,
                                                                d2_len)
-
+            print(dW)
             psi_t = sso.rhs(H_data, psi_t, t + dt * j,
                             A_ops, dt, dW[:, t_idx, j, :], d1, d2, sso.args)
 
@@ -1819,6 +1819,76 @@ def _rhs_rho_euler_homodyne_fast(L, rho_t, t, A, dt, ddW, d1, d2, args):
 # Platen method
 #
 def _rhs_psi_platen(H, psi_t, t, A_ops, dt, dW, d1, d2, args):
+
+    sqrt_dt = np.sqrt(dt)
+    n_A_ops = len(A_ops)
+    d2_len = dW.shape[1]
+    psi_len = len(psi_t)
+
+    n_noises = d2_len * n_A_ops
+    V = np.zeros([n_noises, n_noises])
+
+    for i in range(n_noises):
+        for j in range(i):
+            V[i, j] = dt * (2 * np.random.randint(0, 2) - 1)
+
+    for i in range(n_noises):
+        for j in range(i, n_noises):
+            V[i, j] = -V[j, i]
+
+    V = np.reshape(V, [n_A_ops, d2_len, n_A_ops, d2_len])
+
+    mask = np.ones([n_A_ops, d2_len, n_A_ops, d2_len])
+    for i in range(n_A_ops):
+        for j in range(d2_len):
+            mask[i, j, i, j] = 0
+
+    dpsi_t = _rhs_psi_deterministic(H, psi_t, t, dt, args)
+    d1psi = dpsi_t
+    d2psi = np.zeros([n_A_ops, d2_len, psi_len])
+    for a_idx, A in enumerate(A_ops):
+        d1psi += d1(A, psi_t)*dt
+        d2psi[a_idx,:,:] = d2(A, psi_t)
+
+    psi_t_1 = psi_t + d1psi
+    psi_t_p = psi_t_1[np.newaxis,np.newaxis,:] + sqrt_dt*d2psi
+    psi_t_m = psi_t_1[np.newaxis,np.newaxis,:] - sqrt_dt*d2psi
+    chi_t_p = psi_t[np.newaxis,np.newaxis,:] + sqrt_dt*d2psi
+    chi_t_m = psi_t[np.newaxis, np.newaxis, :] - sqrt_dt*d2psi
+    psi_t_1 += np.sum(dW[:,:,np.newaxis]*d2psi,axis=(0,1))
+
+    d1psi_1 = _rhs_psi_deterministic(H, psi_t_t, t, dt, args)
+    for a_idx, A in enumerate(A_ops):
+        d1psi_1 += d1(A,psi_t_1)*dt
+
+
+    d2psi_p = np.zeros([n_A_ops, d2_len, psi_len])
+    d2psi_m = np.zeros([n_A_ops, d2_len, psi_len])
+    for a_idx, A in enumerate(A_ops):
+        d2psi_p[a_idx,:,:] = d2(A, psi_t_p)
+        d2psi_m[a_idx,:,:] = d2(A, psi_t_m)
+
+    d2chi_p = np.zeros([n_A_ops, d2_len, n_A_ops, d2_len, psi_len])
+    d2chi_m = np.zeros([n_A_ops, d2_len, n_A_ops, d2_len, psi_len])
+    for a_idx, A in enumerate(A_ops):
+        for b_idx, B in enumerate(A_ops):
+            for e2_idx in range(d2_len):
+                d2chi_p[a_idx,:,b_idx,e2_idx,:] = d2(A,chi_t_p[b_idx,e2_idx])
+                d2chi_m[a_idx, :, b_idx, e2_idx, :] = d2(A, chi_t_m[b_idx, e2_idx])
+
+    psi_new = psi_t + 0.5*(d1psi_1 + d1psi)
+    psi_new += 0.25*np.sum(dW[:,:,np.newaxis]*(d2psi_p + d2psi_m + 2.0*d2psi),axis=(0,1))
+    psi_new += 0.25 * np.sum((dW[:, :, np.newaxis] ** 2 - dt) * (d2psi_p - d2psi_m), axis=(0, 1)) / sqrt_dt
+    psi_new += 0.25 * np.sum(mask[:,:,:,:,np.newaxis]*dW[:,:,np.newaxis,np.newaxis,np.newaxis] * (d2chi_p + d2chi_m - 2.0*d2psi[:,:,np.newaxis,np.newaxis,:]),axis=(0,1,2,3))
+    psi_new += 0.25 * np.sum(mask[:,:,:,:,np.newaxis]*(dW[:,:,np.newaxis,np.newaxis,np.newaxis]*dW[np.newaxis,np.newaxis,:,:,np.newaxis]+V[:,:,:,:,np.newaxis])*(d2chi_p-d2chi_m),axis=(0,1,2,3))/sqrt_dt
+
+    return psi_new
+
+
+# -----------------------------------------------------------------------------
+# old Platen method
+#
+def _rhs_psi_platen_old(H, psi_t, t, A_ops, dt, dW, d1, d2, args):
     """
     TODO: support multiple stochastic increments
 
