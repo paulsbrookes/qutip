@@ -742,6 +742,8 @@ def _ssesolve_generic(sso, options, progress_bar):
     data.ss = np.zeros((len(sso.e_ops), sso.N_store), dtype=complex)
     data.noise = []
     data.measurement = []
+    data.measurement_expect = []
+    data.measurement_noise = []
 
     # pre-compute collapse operator combinations that are commonly needed
     # when evaluating the RHS of stochastic Schrodinger equations
@@ -758,10 +760,12 @@ def _ssesolve_generic(sso, options, progress_bar):
                            task_args, task_kwargs, **map_kwargs)
 
     for result in results:
-        states_list, dW, m, expect, ss = result
+        states_list, dW, m, expect, ss, measurement_expect, measurement_noise = result
         data.states.append(states_list)
         data.noise.append(dW)
         data.measurement.append(m)
+        data.measurement_expect.append(measurement_expect)
+        data.measurement_noise.append(measurement_noise)
         data.expect += expect
         data.ss += ss
 
@@ -828,8 +832,13 @@ def _ssesolve_single_trajectory(n, sso):
     else:
         dW = sso.noise[n]
 
+
     states_list = []
     measurements = np.zeros((len(times), len(sso.m_ops), d2_len),
+                            dtype=complex)
+    measurements_noise = np.zeros((len(times), len(sso.m_ops), d2_len),
+                            dtype=complex)
+    measurements_expect = np.zeros((len(times), len(sso.m_ops), d2_len),
                             dtype=complex)
 
     for t_idx, t in enumerate(times):
@@ -854,7 +863,6 @@ def _ssesolve_single_trajectory(n, sso):
                                                   A[3].indptr, psi_t, 1) * dt
                     dW[a_idx, t_idx, j, :] = np.random.poisson(dw_expect,
                                                                d2_len)
-            print(dW)
             psi_t = sso.rhs(H_data, psi_t, t + dt * j,
                             A_ops, dt, dW[:, t_idx, j, :], d1, d2, sso.args)
 
@@ -873,15 +881,20 @@ def _ssesolve_single_trajectory(n, sso):
                                                    psi_t, 0)
                     else:
                         m_expt = 0
-                    mm = (m_expt + dW_factor *
-                          dW[m_idx, t_idx, :, dW_idx].sum() /
-                          (dt * sso.N_substeps))
+                    measurements_noise[t_idx, m_idx, dW_idx] = dW_factor * dW[m_idx, t_idx, :, dW_idx].sum() / (dt * sso.N_substeps)
+                    measurements_expect[t_idx, m_idx, dW_idx] = m_expt
+                    #mm = (m_expt + dW_factor *
+                    #      dW[m_idx, t_idx, :, dW_idx].sum() /
+                    #      (dt * sso.N_substeps))
+                    mm = m_expt + measurements_noise[t_idx, m_idx, dW_idx]
                     measurements[t_idx, m_idx, dW_idx] = mm
 
     if d2_len == 1:
         measurements = measurements.squeeze(axis=(2))
+        measurements_expect = measurements_expect.squeeze(axis=(2))
+        measurements_noise = measurements_noise.squeeze(axis=(2))
 
-    return states_list, dW, measurements, expect, ss
+    return states_list, dW, measurements, expect, ss, measurements_expect, measurements_noise
 
 
 # -----------------------------------------------------------------------------
@@ -1845,10 +1858,10 @@ def _rhs_psi_platen(H, psi_t, t, A_ops, dt, dW, d1, d2, args):
 
     dpsi_t = _rhs_psi_deterministic(H, psi_t, t, dt, args)
     d1psi = dpsi_t
-    d2psi = np.zeros([n_A_ops, d2_len, psi_len])
+    d2psi = np.zeros([n_A_ops, d2_len, psi_len],dtype=np.complex)
     for a_idx, A in enumerate(A_ops):
-        d1psi += d1(A, psi_t)*dt
-        d2psi[a_idx,:,:] = d2(A, psi_t)
+        d1psi += d1(t, psi_t, A, args)*dt
+        d2psi[a_idx,:,:] = d2(t, psi_t, A, args)
 
     psi_t_1 = psi_t + d1psi
     psi_t_p = psi_t_1[np.newaxis,np.newaxis,:] + sqrt_dt*d2psi
@@ -1857,24 +1870,25 @@ def _rhs_psi_platen(H, psi_t, t, A_ops, dt, dW, d1, d2, args):
     chi_t_m = psi_t[np.newaxis, np.newaxis, :] - sqrt_dt*d2psi
     psi_t_1 += np.sum(dW[:,:,np.newaxis]*d2psi,axis=(0,1))
 
-    d1psi_1 = _rhs_psi_deterministic(H, psi_t_t, t, dt, args)
+    d1psi_1 = _rhs_psi_deterministic(H, psi_t_1, t, dt, args)
     for a_idx, A in enumerate(A_ops):
-        d1psi_1 += d1(A,psi_t_1)*dt
+        d1psi_1 += d1(t, psi_t_1, A, args)*dt
 
 
-    d2psi_p = np.zeros([n_A_ops, d2_len, psi_len])
-    d2psi_m = np.zeros([n_A_ops, d2_len, psi_len])
+    d2psi_p = np.zeros([n_A_ops, d2_len, psi_len],dtype=np.complex)
+    d2psi_m = np.zeros([n_A_ops, d2_len, psi_len],dtype=np.complex)
     for a_idx, A in enumerate(A_ops):
-        d2psi_p[a_idx,:,:] = d2(A, psi_t_p)
-        d2psi_m[a_idx,:,:] = d2(A, psi_t_m)
+        for d2_idx in range(d2_len):
+            d2psi_p[a_idx,:,:] = d2(t, psi_t_p[a_idx,d2_idx], A, args)
+            d2psi_m[a_idx,:,:] = d2(t, psi_t_m[a_idx,d2_idx], A, args)
 
-    d2chi_p = np.zeros([n_A_ops, d2_len, n_A_ops, d2_len, psi_len])
-    d2chi_m = np.zeros([n_A_ops, d2_len, n_A_ops, d2_len, psi_len])
+    d2chi_p = np.zeros([n_A_ops, d2_len, n_A_ops, d2_len, psi_len],dtype=np.complex)
+    d2chi_m = np.zeros([n_A_ops, d2_len, n_A_ops, d2_len, psi_len],dtype=np.complex)
     for a_idx, A in enumerate(A_ops):
         for b_idx, B in enumerate(A_ops):
             for e2_idx in range(d2_len):
-                d2chi_p[a_idx,:,b_idx,e2_idx,:] = d2(A,chi_t_p[b_idx,e2_idx])
-                d2chi_m[a_idx, :, b_idx, e2_idx, :] = d2(A, chi_t_m[b_idx, e2_idx])
+                d2chi_p[a_idx,:,b_idx,e2_idx,:] = d2(t,chi_t_p[b_idx,e2_idx],A,args)
+                d2chi_m[a_idx, :, b_idx, e2_idx, :] = d2(t,chi_t_m[b_idx, e2_idx],A,args)
 
     psi_new = psi_t + 0.5*(d1psi_1 + d1psi)
     psi_new += 0.25*np.sum(dW[:,:,np.newaxis]*(d2psi_p + d2psi_m + 2.0*d2psi),axis=(0,1))
