@@ -1832,7 +1832,9 @@ def _rhs_rho_euler_homodyne_fast(L, rho_t, t, A, dt, ddW, d1, d2, args):
 # Platen method
 #
 def _rhs_psi_platen(H, psi_t, t, A_ops, dt, dW, d1, d2, args):
-
+    """
+    Platen for multiple stochastic collapse operators with both homodyne and heterodyne detection.
+    """
     sqrt_dt = np.sqrt(dt)
     n_A_ops = len(A_ops)
     d2_len = dW.shape[1]
