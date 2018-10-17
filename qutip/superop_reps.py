@@ -218,7 +218,7 @@ def choi_to_kraus(q_oper):
     """
     vals, vecs = eig(q_oper.data.todense())
     vecs = [array(_) for _ in zip(*vecs)]
-    return [Qobj(inpt=sqrt(val)*vec2mat(vec)) for val, vec in zip(vals, vecs)]
+    return [Qobj(inpt=sqrt(val)*vec2mat(vec),dims=q_oper.dims[0]) for val, vec in zip(vals, vecs)]
 
 
 def kraus_to_choi(kraus_list):
