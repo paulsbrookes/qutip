@@ -217,7 +217,7 @@ class StochasticSolverOptions:
                  solver=None, method=None, distribution='normal',
                  store_measurement=False, noise=None, normalize=True,
                  options=None, progress_bar=None, map_func=None,
-                 map_kwargs=None):
+                 map_kwargs=None, transformation=False, noise_on=True):
 
         if options is None:
             options = Options()
@@ -255,6 +255,8 @@ class StochasticSolverOptions:
         self.noise = noise
         self.args = args
         self.normalize = normalize
+        self.transformation = transformation
+        self.noise_on = noise_on
 
         self.generate_noise = generate_noise
         self.generate_A_ops = generate_A_ops
@@ -744,6 +746,7 @@ def _ssesolve_generic(sso, options, progress_bar):
     data.measurement = []
     data.measurement_expect = []
     data.measurement_noise = []
+    data.sso = sso
 
     # pre-compute collapse operator combinations that are commonly needed
     # when evaluating the RHS of stochastic Schrodinger equations
@@ -752,7 +755,10 @@ def _ssesolve_generic(sso, options, progress_bar):
     map_kwargs = {'progress_bar': progress_bar}
     map_kwargs.update(sso.map_kwargs)
 
-    task = _ssesolve_single_trajectory
+    if sso.transformation:
+        _ssesolve_single_trajectory_transformation
+    else:
+        task = _ssesolve_single_trajectory
     task_args = (sso,)
     task_kwargs = {}
 
@@ -768,6 +774,7 @@ def _ssesolve_generic(sso, options, progress_bar):
         data.measurement_noise.append(measurement_noise)
         data.expect += expect
         data.ss += ss
+
 
     # average density matrices
     if options.average_states and np.any(data.states):
@@ -789,10 +796,11 @@ def _ssesolve_generic(sso, options, progress_bar):
                    if e.isherm else data.expect[n, :]
                    for n, e in enumerate(sso.e_ops)]
 
+
     return data
 
 
-def _ssesolve_single_trajectory(n, sso):
+def _ssesolve_single_trajectory_transformation(n, sso):
     """
     Internal function. See ssesolve.
     """
@@ -850,7 +858,115 @@ def _ssesolve_single_trajectory(n, sso):
                                       e.data.indptr, psi_t, 0)
                 expect[e_idx, t_idx] += s
                 ss[e_idx, t_idx] += s ** 2
+        if sso.store_states:
+            states_list.append(Qobj(psi_t, dims=dims))
+
+        for j in range(sso.N_substeps):
+
+            if sso.noise is None and not sso.homogeneous:
+                for a_idx, A in enumerate(A_ops):
+                    # dw_expect = norm(spmv(A[0], psi_t)) ** 2 * dt
+                    dw_expect = cy_expect_psi_csr(A[3].data,
+                                                  A[3].indices,
+                                                  A[3].indptr, psi_t, 1) * dt
+                    dW[a_idx, t_idx, j, :] = np.random.poisson(dw_expect,
+                                                               d2_len)
+            psi_t = sso.rhs(H_data, psi_t, t + dt * j,
+                            A_ops, dt, dW[:, t_idx, j, :], d1, d2, sso.args)
+
+            # optionally renormalize the wave function
+            if sso.normalize:
+                psi_t /= norm(psi_t)
+
+        if sso.store_measurement:
+            for m_idx, m in enumerate(sso.m_ops):
+                for dW_idx, dW_factor in enumerate(sso.dW_factors):
+                    if m[dW_idx]:
+                        m_data = m[dW_idx].data
+                        m_expt = cy_expect_psi_csr(m_data.data,
+                                                   m_data.indices,
+                                                   m_data.indptr,
+                                                   psi_t, 0)
+                    else:
+                        m_expt = 0
+                    measurements_noise[t_idx, m_idx, dW_idx] = dW_factor * dW[m_idx, t_idx, :, dW_idx].sum() / (dt * sso.N_substeps)
+                    measurements_expect[t_idx, m_idx, dW_idx] = m_expt
+                    #mm = (m_expt + dW_factor *
+                    #      dW[m_idx, t_idx, :, dW_idx].sum() /
+                    #      (dt * sso.N_substeps))
+                    mm = m_expt + measurements_noise[t_idx, m_idx, dW_idx]
+                    measurements[t_idx, m_idx, dW_idx] = mm
+
+    if d2_len == 1:
+        measurements = measurements.squeeze(axis=(2))
+        measurements_expect = measurements_expect.squeeze(axis=(2))
+        measurements_noise = measurements_noise.squeeze(axis=(2))
+
+    return states_list, dW, measurements, expect, ss, measurements_expect, measurements_noise
+
+
+def _ssesolve_single_trajectory(n, sso):
+    """
+    Internal function. See ssesolve.
+    """
+    dt = sso.dt
+    times = sso.times
+    d1, d2 = sso.d1, sso.d2
+    d2_len = sso.d2_len
+    e_ops = sso.e_ops
+    H_data = sso.H.data
+    A_ops = sso.A_ops
+
+    expect = np.zeros((len(sso.e_ops), sso.N_store), dtype=complex)
+    ss = np.zeros((len(sso.e_ops), sso.N_store), dtype=complex)
+
+    psi_t = sso.state0.full().ravel()
+    dims = sso.state0.dims
+
+    # reseed the random number generator so that forked
+    # processes do not get the same sequence of random numbers
+    np.random.seed((n+1) * np.random.randint(0, 4294967295 // (sso.ntraj+1)))
+
+    if sso.noise is None:
+        if sso.homogeneous:
+            if sso.distribution == 'normal':
+                dW = np.sqrt(dt) * \
+                    np.random.randn(len(A_ops), sso.N_store, sso.N_substeps,
+                                    d2_len)
+            else:
+                raise TypeError('Unsupported increment distribution for ' +
+                                'homogeneous process.')
         else:
+            if sso.distribution != 'poisson':
+                raise TypeError('Unsupported increment distribution for ' +
+                                'inhomogeneous process.')
+
+            dW = np.zeros((len(A_ops), sso.N_store, sso.N_substeps, d2_len))
+    else:
+        dW = sso.noise[n]
+
+    if not sso.noise_on:
+        dW *= 0.0
+
+
+    states_list = []
+    measurements = np.zeros((len(times), len(sso.m_ops), d2_len),
+                            dtype=complex)
+    measurements_noise = np.zeros((len(times), len(sso.m_ops), d2_len),
+                            dtype=complex)
+    measurements_expect = np.zeros((len(times), len(sso.m_ops), d2_len),
+                            dtype=complex)
+
+    for t_idx, t in enumerate(times):
+
+        if e_ops:
+            for e_idx, e in enumerate(e_ops):
+                s = cy_expect_psi_csr(e.data.data,
+                                      e.data.indices,
+                                      e.data.indptr, psi_t, 0)
+                expect[e_idx, t_idx] += s
+                ss[e_idx, t_idx] += s ** 2
+        if sso.store_states:
             states_list.append(Qobj(psi_t, dims=dims))
 
         for j in range(sso.N_substeps):
@@ -1411,6 +1527,7 @@ def d1_psi_heterodyne(t, psi, A, args):
         \\frac{1}{2}\\langle C \\rangle\\langle C^\\dagger \\rangle))\psi
 
     """
+
     e_C = cy_expect_psi_csr(A[0].data, A[0].indices, A[0].indptr, psi, 0)
     B = A[0].T.conj()
     e_Cd = cy_expect_psi_csr(B.data, B.indices, B.indptr, psi, 0)
@@ -1835,6 +1952,7 @@ def _rhs_psi_platen(H, psi_t, t, A_ops, dt, dW, d1, d2, args):
     """
     Platen for multiple stochastic collapse operators with both homodyne and heterodyne detection.
     """
+
     sqrt_dt = np.sqrt(dt)
     n_A_ops = len(A_ops)
     d2_len = dW.shape[1]
