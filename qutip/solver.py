@@ -128,7 +128,7 @@ class Options():
                  rhs_filename=None, ntraj=500, gui=False, rhs_with_state=False,
                  store_final_state=False, store_states=False, seeds=None,
                  steady_state_average=False, normalize_output=True,
-                 use_openmp=None, openmp_threads=None):
+                 use_openmp=None, openmp_threads=None, moving_basis=False, moving_mode_indices=None):
         # Absolute tolerance (default = 1e-8)
         self.atol = atol
         # Relative tolerance (default = 1e-6)
@@ -189,6 +189,9 @@ class Options():
         self.normalize_output = normalize_output
         # Use OPENMP for sparse matrix vector multiplication
         self.use_openmp = use_openmp
+
+        self.moving_basis = moving_basis
+        self.moving_mode_indices = moving_mode_indices
 
     def __str__(self):
         if self.seeds is None:
