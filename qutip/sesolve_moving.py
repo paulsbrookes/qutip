@@ -5,6 +5,7 @@ import scipy
 import itertools
 import copy
 from qutip.tensor import tensor
+from qutip.operators import qeye, destroy
 
 
 def gen_c_matrix(operator, threshold=None):
