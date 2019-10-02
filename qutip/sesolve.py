@@ -37,6 +37,7 @@ This module provides solvers for the unitary Schrodinger equation.
 __all__ = ['sesolve']
 
 import os
+from copy import deepcopy
 import types
 from functools import partial
 import numpy as np
@@ -59,6 +60,9 @@ from qutip.cy.utilities import _cython_build_cleanup
 
 from qutip.ui.progressbar import (BaseProgressBar, TextProgressBar)
 from qutip.cy.openmp.utilities import check_use_openmp, openmp_components
+from qutip.operators import destroy, displace, qeye, commutator
+from qutip.tensor import tensor
+from qutip.expect import expect
 
 if qset.has_openmp:
     from qutip.cy.openmp.parfuncs import cy_ode_rhs_openmp
@@ -66,6 +70,7 @@ if qset.has_openmp:
 if debug:
     import inspect
 
+import time
 
 def sesolve(H, psi0, tlist, e_ops=[], args={}, options=None,
             progress_bar=None,
@@ -289,7 +294,29 @@ def _sesolve_list_func_td(H_list, psi0, tlist, e_ops, args, opt,
 # [Qobj, function] style time dependence API
 #
 def psi_list_td(t, psi, H_list_and_args):
+    #start = time.time()
+    H_list = H_list_and_args[0]
+    args = H_list_and_args[1]
 
+    H = H_list[0][0]
+    H_td = H_list[0][1]
+    H_total = H*H_td(t, args)
+    for n in range(1, len(H_list)):
+        #
+        # args[n][0] = the sparse data for a Qobj in operator form
+        # args[n][1] = function callback giving the coefficient
+        #
+        H = H_list[n][0]
+        H_td = H_list[n][1]
+        H_total += H*H_td(t, args)
+    out = np.zeros(psi.shape[0],dtype=complex)
+    spmvpy_csr(H_total.data, H_total.indices, H_total.indptr, psi, 1.0, out)
+    #print(time.time()-start)
+    return out
+
+
+def psi_list_td_backup(t, psi, H_list_and_args):
+    #start = time.time()
     H_list = H_list_and_args[0]
     args = H_list_and_args[1]
 
@@ -305,7 +332,7 @@ def psi_list_td(t, psi, H_list_and_args):
         H = H_list[n][0]
         H_td = H_list[n][1]
         spmvpy_csr(H.data, H.indices, H.indptr, psi, H_td(t, args), out)
-
+    #print(time.time()-start)
     return out
 
 
@@ -625,7 +652,6 @@ def _sesolve_func_td(H_func, psi0, tlist, e_ops, args, opt, progress_bar):
     Evolve the wave function using an ODE solver with time-dependent
     Hamiltonian.
     """
-
     if debug:
         print(inspect.stack()[0][3])
 
@@ -633,15 +659,17 @@ def _sesolve_func_td(H_func, psi0, tlist, e_ops, args, opt, progress_bar):
     # check initial state or oper
     #
     if psi0.isket:
-        initial_vector = psi0.full().ravel()
         oper_evo = False
     elif psi0.isunitary:
-        initial_vector = operator_to_vector(psi0).full().ravel()
         oper_evo = True
     else:
         raise TypeError("The unitary solver requires psi0 to be"
                         " a ket as initial state"
                         " or a unitary as initial operator.")
+
+    if opt.moving_mode_indices is None:
+        n_modes = len(psi0.dims[0])
+        opt.moving_mode_indices = np.arange(n_modes)
 
     #
     # setup integrator
@@ -681,20 +709,43 @@ def _sesolve_func_td(H_func, psi0, tlist, e_ops, args, opt, progress_bar):
             L_func = lambda t, args: spre(H_func(t, args))
 
     else:
-        initial_vector = psi0.full().ravel()
+        new_psi0 = psi0
+        initial_vector = new_psi0.full().ravel()
         L_func = H_func
+        if opt.moving_basis:
+            initial_mode_displacements = np.zeros(len(opt.moving_mode_indices), dtype=complex)
+            for mode_idx in opt.moving_mode_indices:
+                identities = [qeye(dim) for dim in psi0.dims[0]]
+                a_op_components = identities
+                a_op_components[mode_idx] = destroy(psi0.dims[0][mode_idx])
+                a_op = tensor(a_op_components)
+                a_expect = expect(a_op, psi0)
+                initial_mode_displacements[mode_idx] = a_expect
+                displacement_components = identities
+                displacement_components[mode_idx] = displace(psi0.dims[0][mode_idx], -a_expect)
+                displacement_op = tensor(displacement_components)
+                new_psi0 = displacement_op * new_psi0
+            initial_vector = np.hstack([initial_vector, initial_mode_displacements])
 
     if not opt.rhs_with_state:
         r = scipy.integrate.ode(cy_ode_psi_func_td)
+        print('Cython function.')
+        #r = scipy.integrate.ode(_ode_psi_func_td)
     else:
-        r = scipy.integrate.ode(cy_ode_psi_func_td_with_state)
+        if opt.moving_basis:
+            r = scipy.integrate.ode(_ode_psi_func_td_with_state_moving_basis)
+        else:
+            r = scipy.integrate.ode(_ode_psi_func_td_with_state)
 
     r.set_integrator('zvode', method=opt.method, order=opt.order,
                      atol=opt.atol, rtol=opt.rtol, nsteps=opt.nsteps,
                      first_step=opt.first_step, min_step=opt.min_step,
                      max_step=opt.max_step)
     r.set_initial_value(initial_vector, tlist[0])
-    r.set_f_params(L_func, new_args)
+    if opt.moving_basis:
+        r.set_f_params(L_func, new_args, opt, psi0.dims)
+    else:
+        r.set_f_params(L_func, new_args)
 
     #
     # call generic ODE code
@@ -707,13 +758,46 @@ def _sesolve_func_td(H_func, psi0, tlist, e_ops, args, opt, progress_bar):
 # evaluate dpsi(t)/dt for time-dependent hamiltonian
 #
 def _ode_psi_func_td(t, psi, H_func, args):
+    #start = time.time()
     H = H_func(t, args)
-    return -1j * (H * psi)
+    dpsi = -1j * (H * psi)
+    #print(time.time()-start)
+    return dpsi
 
 
 def _ode_psi_func_td_with_state(t, psi, H_func, args):
     H = H_func(t, psi, args)
-    return -1j * (H * psi)
+    dpsi = -1j * (H * psi)
+    return dpsi
+
+
+def _ode_psi_func_td_with_state_moving_basis(t, y, H_func, args, opt, dims):
+    n_moving_modes = len(opt.moving_mode_indices)
+    n_modes = len(dims[0])
+    psi = y[0:-n_modes]
+    mode_displacements = y[-n_modes:]
+    # print(type(args), type(mode_displacements))
+    args = [args] + list(mode_displacements)
+    H = H_func(t, psi, *args)
+    ddisplacements = np.zeros(n_modes, dtype=complex)
+    H_rotation = 0
+    for mode_idx in opt.moving_mode_indices:
+        operators = [qeye(dim) for dim in dims[0]]
+        operators[mode_idx] = destroy(dims[0][mode_idx])
+        a_op = tensor(operators)
+        com = commutator(H, a_op)
+        ddisplacement = 1j * np.sum(np.conjugate(psi) * com * psi)
+        ddisplacements[mode_idx] = ddisplacement
+        displacement = mode_displacements[mode_idx]
+        H_mode_rotation = 0.5 * 1j * displacement * np.conjugate(ddisplacement) + 1j * np.conjugate(
+            ddisplacement) * a_op
+        H_mode_rotation += H_mode_rotation.dag()
+        H_rotation += H_mode_rotation
+    H = H + H_rotation
+    dpsi = -1j * (H * psi)
+    dy = np.hstack([dpsi, ddisplacements])
+    return dy
+
 
 # -----------------------------------------------------------------------------
 # Solve an ODE which solver parameters already setup (r). Calculate the
@@ -723,7 +807,6 @@ def _generic_ode_solve(r, psi0, tlist, e_ops, opt, progress_bar, dims=None):
     """
     Internal function for solving ODEs.
     """
-
     #
     # prepare output array
     #
@@ -731,6 +814,8 @@ def _generic_ode_solve(r, psi0, tlist, e_ops, opt, progress_bar, dims=None):
     output = Result()
     output.solver = "sesolve"
     output.times = tlist
+
+    n_modes = len(psi0.dims[0])
 
     if psi0.isunitary:
         oper_evo = True
@@ -770,12 +855,17 @@ def _generic_ode_solve(r, psi0, tlist, e_ops, opt, progress_bar, dims=None):
         if oper_evo:
             return r.y.reshape([oper_n, oper_n]).T
         else:
-            return r.y
+            if opt.moving_basis:
+                return r.y[0:-n_modes]
+            else:
+                return r.y
 
     #
     # start evolution
     #
     progress_bar.start(n_tsteps)
+
+    output.displacements = np.zeros([n_modes, len(tlist)], dtype=complex)
 
     dt = np.diff(tlist)
     for t_idx, t in enumerate(tlist):
@@ -802,13 +892,15 @@ def _generic_ode_solve(r, psi0, tlist, e_ops, opt, progress_bar, dims=None):
         if opt.store_states:
             output.states.append(Qobj(cdata, dims=dims))
 
+        if opt.moving_basis:
+            output.displacements[:, t_idx] = r.y[-n_modes:]
+
         if expt_callback:
             # use callback method
             e_ops(t, Qobj(cdata, dims=dims))
 
         for m in range(n_expt_op):
-            output.expect[m][t_idx] = cy_expect_psi(e_ops[m].data,
-                                                    cdata, e_ops[m].isherm)
+            output.expect[m][t_idx] = cy_expect_psi(e_ops[m].data, cdata, e_ops[m].isherm)
 
         if t_idx < n_tsteps - 1:
             r.integrate(r.t + dt[t_idx])

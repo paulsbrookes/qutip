@@ -177,7 +177,7 @@ cpdef cnp.ndarray[complex, ndim=1, mode="c"] cy_ode_psi_func_td_with_state(
         object H_func,
         object args):
 
-    H = H_func(t, psi, args)
+    H = H_func(t, psi, args).data
     return -1j * spmv_csr(H.data, H.indices, H.indptr, psi)
 
 
