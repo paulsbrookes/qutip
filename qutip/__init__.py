@@ -219,6 +219,7 @@ from qutip.rcsolve import *
 from qutip.nonmarkov import *
 from qutip.interpolate import *
 from qutip.scattering import *
+from qutip.sesolve_moving import *
 
 # quantum information
 from qutip.qip import *
